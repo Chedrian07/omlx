@@ -255,6 +255,24 @@ class BatchedEngine(BaseEngine):
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
 
+            uniform_enabled = getattr(self._model_settings, "uniform_kv_enabled", False)
+            if uniform_enabled:
+                self._engine.engine.scheduler._uniform_kv_bits = int(
+                    getattr(self._model_settings, "uniform_kv_bits", 4)
+                )
+                self._engine.engine.scheduler._uniform_kv_group_size = int(
+                    getattr(self._model_settings, "uniform_kv_group_size", 64)
+                )
+                self._engine.engine.scheduler._uniform_quantized_kv_start = int(
+                    getattr(self._model_settings, "uniform_quantized_kv_start", 0)
+                )
+                logger.info(
+                    "Uniform KV cache enabled: %s bits group=%s start=%s",
+                    self._engine.engine.scheduler._uniform_kv_bits,
+                    self._engine.engine.scheduler._uniform_kv_group_size,
+                    self._engine.engine.scheduler._uniform_quantized_kv_start,
+                )
+
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
             specprefill_draft = getattr(self._model_settings, "specprefill_draft_model", None)

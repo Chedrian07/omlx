@@ -44,6 +44,7 @@ class CacheTypeRegistry:
         "KVCache": CacheType.KVCACHE,
         "RotatingKVCache": CacheType.ROTATING_KVCACHE,
         "BatchKVCache": CacheType.BATCH_KVCACHE,
+        "BatchQuantizedKVCache": CacheType.QUANTIZED_KVCACHE,
         "BatchRotatingKVCache": CacheType.BATCH_ROTATING_KVCACHE,
         "ArraysCache": CacheType.ARRAYS_CACHE,
         "QuantizedKVCache": CacheType.QUANTIZED_KVCACHE,

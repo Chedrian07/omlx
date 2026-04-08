@@ -24,6 +24,7 @@ import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationBatch,
+    PromptProcessingBatch,
     SequenceStateMachine,
     generation_stream,
 )
@@ -36,6 +37,7 @@ from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .exceptions import is_cache_corruption_error
+from .batch_quantized_kv import BatchQuantizedKVCache, quantize_batch_cache
 
 
 def _sync_and_clear_cache():
@@ -143,10 +145,51 @@ def _patched_generation_batch_step(self):
 
 GenerationBatch._step = _patched_generation_batch_step
 
+_original_prompt_batch_copy = PromptProcessingBatch._copy
+
+
+def _patched_prompt_batch_copy(self):
+    new_batch = _original_prompt_batch_copy(self)
+    for attr in (
+        "_uniform_kv_enabled",
+        "_uniform_kv_bits",
+        "_uniform_kv_group_size",
+        "_uniform_quantized_kv_start",
+    ):
+        if hasattr(self, attr):
+            setattr(new_batch, attr, getattr(self, attr))
+    return new_batch
+
+
+PromptProcessingBatch._copy = _patched_prompt_batch_copy
+
+_original_prompt_batch_generate = PromptProcessingBatch.generate
+
+
+def _patched_prompt_batch_generate(self, tokens):
+    if getattr(self, "_uniform_kv_enabled", False):
+        bits = int(getattr(self, "_uniform_kv_bits", 4))
+        group_size = int(getattr(self, "_uniform_kv_group_size", 64))
+        quantized_kv_start = int(getattr(self, "_uniform_quantized_kv_start", 0))
+        self.prompt_cache = [
+            quantize_batch_cache(
+                cache_obj,
+                bits=bits,
+                group_size=group_size,
+                quantized_kv_start=quantized_kv_start,
+            )
+            for cache_obj in self.prompt_cache
+        ]
+    return _original_prompt_batch_generate(self, tokens)
+
+
+PromptProcessingBatch.generate = _patched_prompt_batch_generate
+
 
 # Cache class names known to be sliceable (no boundary snapshots needed).
 _KNOWN_SLICEABLE_CACHE_TYPES = frozenset({
     "KVCache", "BatchKVCache", "QuantizedKVCache",
+    "BatchQuantizedKVCache",
     "TurboQuantKVCache", "BatchTurboQuantKVCache",
 })
 
@@ -405,6 +448,9 @@ class Scheduler:
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: Optional[float] = None
+        self._uniform_kv_bits: Optional[int] = None
+        self._uniform_kv_group_size: int = 64
+        self._uniform_quantized_kv_start: int = 0
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -929,6 +975,14 @@ class Scheduler:
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
         )
+
+        if self._uniform_kv_bits is not None:
+            bg._prompt_batch._uniform_kv_enabled = True
+            bg._prompt_batch._uniform_kv_bits = int(self._uniform_kv_bits)
+            bg._prompt_batch._uniform_kv_group_size = int(self._uniform_kv_group_size)
+            bg._prompt_batch._uniform_quantized_kv_start = int(
+                self._uniform_quantized_kv_start
+            )
 
         return bg
 

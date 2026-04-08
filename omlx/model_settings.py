@@ -61,6 +61,12 @@ class ModelSettings:
     turboquant_kv_enabled: bool = False
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
 
+    # Uniform KV cache quantization (mlx-lm / mlx-vlm native path)
+    uniform_kv_enabled: bool = False
+    uniform_kv_bits: int = 4
+    uniform_kv_group_size: int = 64
+    uniform_quantized_kv_start: int = 0
+
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
     specprefill_draft_model: Optional[str] = None  # Path to draft model (must share tokenizer)
