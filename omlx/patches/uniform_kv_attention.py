@@ -66,5 +66,20 @@ def apply_uniform_kv_attention_patch() -> None:
 
     mlx_base.scaled_dot_product_attention = _mlx_patched
     vlm_base.scaled_dot_product_attention = _vlm_patched
+
+    import sys
+
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None:
+            continue
+        if not (
+            mod_name.startswith("mlx_lm.models.") or mod_name.startswith("mlx_vlm.models.")
+        ):
+            continue
+        if hasattr(mod, "scaled_dot_product_attention"):
+            func = getattr(mod, "scaled_dot_product_attention")
+            if func is original_mlx_sdpa or func is original_vlm_sdpa:
+                setattr(mod, "scaled_dot_product_attention", _vlm_patched)
+
     _PATCHED = True
     logger.info("Uniform KV attention patch applied")
