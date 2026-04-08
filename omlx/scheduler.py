@@ -3632,8 +3632,9 @@ class Scheduler:
                     f"Cache corruption detected: {e}, "
                     f"clearing cache and re-prefilling..."
                 )
-                logger.debug(
-                    f"Cache corruption traceback:\n{traceback.format_exc()}"
+                logger.warning(
+                    "Cache corruption traceback:\n%s",
+                    traceback.format_exc(),
                 )
                 # Full reset: clear batch generator, all caches, VLM state
                 self._recover_from_cache_error()
