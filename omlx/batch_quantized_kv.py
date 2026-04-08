@@ -114,6 +114,22 @@ class BatchQuantizedKVCache:
             self.values, self._idx
         )
 
+    def dequantize(self, keys_state=None, values_state=None):
+        keys_state = keys_state if keys_state is not None else self.keys
+        values_state = values_state if values_state is not None else self.values
+        return (
+            mx.dequantize(
+                *keys_state,
+                group_size=self.group_size,
+                bits=self.bits,
+            ),
+            mx.dequantize(
+                *values_state,
+                group_size=self.group_size,
+                bits=self.bits,
+            ),
+        )
+
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         if left_padding is not None:
             if self.keys is not None:

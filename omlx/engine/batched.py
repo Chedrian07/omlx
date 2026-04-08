@@ -257,6 +257,9 @@ class BatchedEngine(BaseEngine):
 
             uniform_enabled = getattr(self._model_settings, "uniform_kv_enabled", False)
             if uniform_enabled:
+                from ..patches.uniform_kv_attention import apply_uniform_kv_attention_patch
+
+                apply_uniform_kv_attention_patch()
                 self._engine.engine.scheduler._uniform_kv_bits = int(
                     getattr(self._model_settings, "uniform_kv_bits", 4)
                 )
