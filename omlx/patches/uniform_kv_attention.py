@@ -25,13 +25,19 @@ def apply_uniform_kv_attention_patch() -> None:
     original_mlx_sdpa = mlx_base.scaled_dot_product_attention
     original_vlm_sdpa = vlm_base.scaled_dot_product_attention
 
+    def _unwrap_cache(cache):
+        if hasattr(cache, "_cache"):
+            return cache._cache
+        return cache
+
     def _mlx_patched(queries, keys, values, cache, scale, mask, sinks=None):
-        if isinstance(cache, BatchQuantizedKVCache):
+        real_cache = _unwrap_cache(cache)
+        if isinstance(real_cache, BatchQuantizedKVCache):
             if sinks is not None:
                 raise ValueError(
                     "BatchQuantizedKVCache does not support attention sinks."
                 )
-            dq_keys, dq_values = cache.dequantize(keys, values)
+            dq_keys, dq_values = real_cache.dequantize(keys, values)
             return mx.fast.scaled_dot_product_attention(
                 queries,
                 dq_keys.astype(queries.dtype),
@@ -42,12 +48,13 @@ def apply_uniform_kv_attention_patch() -> None:
         return original_mlx_sdpa(queries, keys, values, cache, scale, mask, sinks)
 
     def _vlm_patched(queries, keys, values, cache, scale, mask, sinks=None):
-        if isinstance(cache, BatchQuantizedKVCache):
+        real_cache = _unwrap_cache(cache)
+        if isinstance(real_cache, BatchQuantizedKVCache):
             if sinks is not None:
                 raise ValueError(
                     "BatchQuantizedKVCache does not support attention sinks."
                 )
-            dq_keys, dq_values = cache.dequantize(keys, values)
+            dq_keys, dq_values = real_cache.dequantize(keys, values)
             return mx.fast.scaled_dot_product_attention(
                 queries,
                 dq_keys.astype(queries.dtype),
