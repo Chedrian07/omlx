@@ -1105,6 +1105,40 @@ class VLMBatchedEngine(BaseEngine):
                     if k != "inputs_embeds" and v is not None:
                         extra_kwargs[k] = v
 
+            # Capture VLM language-model state that upstream mlx-vlm stores
+            # as INSTANCE ATTRIBUTES on the shared LanguageModel singleton
+            # (e.g. Qwen3.5 stores ``_position_ids`` and ``_rope_deltas``).
+            # Concurrent requests overwrite each other's state between
+            # ``get_input_embeddings`` and the scheduler's prefill call,
+            # causing mRoPE shape mismatches such as:
+            #
+            #   ValueError: [broadcast_shapes] Shapes (1,8,331,64) and
+            #               (1,1,293,64) cannot be broadcast.
+            #
+            # We snapshot the state atomically here (still inside the
+            # same synchronous block as ``get_input_embeddings``) and
+            # forward it per-request via ``_vlm_state_*`` keys that the
+            # scheduler preserves unchanged across chunked prefill. The
+            # VLMModelAdapter then restores the state on the language
+            # model immediately before each chunk call.
+            lm = getattr(self._vlm_model, "language_model", None)
+            if lm is not None:
+                stored_pos = getattr(lm, "_position_ids", None)
+                if stored_pos is not None:
+                    extra_kwargs["_vlm_state_position_ids"] = stored_pos
+                stored_rope = getattr(lm, "_rope_deltas", None)
+                if stored_rope is not None:
+                    extra_kwargs["_vlm_state_rope_deltas"] = stored_rope
+                # Eagerly clear the shared attributes so a subsequent
+                # request's ``get_input_embeddings`` cannot latch onto
+                # leftover state from this one, and so text-only requests
+                # interleaved after this VLM request still recompute
+                # cleanly via ``clear_vlm_position_state``.
+                if stored_pos is not None:
+                    lm._position_ids = None
+                if stored_rope is not None:
+                    lm._rope_deltas = None
+
             # Extract token IDs as list
             token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
 

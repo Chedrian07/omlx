@@ -258,13 +258,28 @@ def _vlm_extra_seq_slice(val: mx.array, s: slice) -> mx.array:
     return val[:, s]
 
 
+# Keys prefixed with ``_vlm_state_`` are pinned per-request state blobs
+# (e.g. full-sequence mRoPE position_ids captured from the shared VLM
+# LanguageModel instance attributes). The scheduler must forward them
+# unchanged across chunked prefill so downstream consumers can restore
+# them atomically on the language model right before each chunk.
+_VLM_STATE_PREFIX = "_vlm_state_"
+
+
 def _slice_vlm_extra(
     extra: Dict[str, Any], n: int
 ) -> Dict[str, Any]:
-    """Slice VLM extra kwargs to first n tokens along seq dimension."""
+    """Slice VLM extra kwargs to first n tokens along seq dimension.
+
+    Keys with the ``_vlm_state_`` prefix are passed through untouched
+    because they represent full-sequence state (restored on the language
+    model at call time, sliced there by cache_offset).
+    """
     sliced: Dict[str, Any] = {}
     for key, val in extra.items():
-        if isinstance(val, mx.array) and val.ndim >= 2:
+        if key.startswith(_VLM_STATE_PREFIX):
+            sliced[key] = val
+        elif isinstance(val, mx.array) and val.ndim >= 2:
             sliced[key] = _vlm_extra_seq_slice(val, slice(None, n))
         else:
             sliced[key] = val
@@ -274,10 +289,16 @@ def _slice_vlm_extra(
 def _advance_vlm_extra(
     extra: Dict[str, Any], n: int
 ) -> Dict[str, Any]:
-    """Advance VLM extra kwargs past first n tokens along seq dimension."""
+    """Advance VLM extra kwargs past first n tokens along seq dimension.
+
+    Keys with the ``_vlm_state_`` prefix are passed through untouched
+    (see ``_slice_vlm_extra``).
+    """
     advanced: Dict[str, Any] = {}
     for key, val in extra.items():
-        if isinstance(val, mx.array) and val.ndim >= 2:
+        if key.startswith(_VLM_STATE_PREFIX):
+            advanced[key] = val
+        elif isinstance(val, mx.array) and val.ndim >= 2:
             advanced[key] = _vlm_extra_seq_slice(val, slice(n, None))
         else:
             advanced[key] = val

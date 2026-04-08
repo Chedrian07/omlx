@@ -242,6 +242,24 @@ class VLMModelAdapter(nn.Module):
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
 
+        # Restore per-request VLM LanguageModel state captured by
+        # ``VLMBatchedEngine._prepare_vision_inputs``. mlx-vlm stores
+        # mRoPE ``_position_ids`` / ``_rope_deltas`` as instance
+        # attributes on the shared language model, which races across
+        # concurrent requests; the scheduler forwards them per-request
+        # via ``_vlm_state_*`` keys and we reinstall them here, just
+        # before the model call, so each chunk sees its own state.
+        # Use ``dict()`` copy so pop() does not mutate the scheduler's
+        # cached extra_kwargs (which are reused across prefill chunks).
+        if vlm_extra:
+            vlm_extra = dict(vlm_extra)
+            state_position_ids = vlm_extra.pop("_vlm_state_position_ids", None)
+            state_rope_deltas = vlm_extra.pop("_vlm_state_rope_deltas", None)
+            if state_position_ids is not None:
+                self._language_model._position_ids = state_position_ids
+            if state_rope_deltas is not None:
+                self._language_model._rope_deltas = state_rope_deltas
+
         if inputs_embeds is not None:
             # Batched VLM path: embeddings from _process_prompts
             result = self._language_model(
