@@ -232,7 +232,9 @@ class BatchedEngine(BaseEngine):
 
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
-        scheduler_config.model_name = self._model_name  # Ensure cache isolation per model
+        scheduler_config.model_name = self._model_name
+        if not getattr(scheduler_config, "cache_namespace", ""):
+            scheduler_config.cache_namespace = self._model_name
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,

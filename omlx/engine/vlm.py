@@ -610,6 +610,8 @@ class VLMBatchedEngine(BaseEngine):
             else SchedulerConfig()
         )
         scheduler_config.model_name = self._model_name
+        if not getattr(scheduler_config, "cache_namespace", ""):
+            scheduler_config.cache_namespace = self._model_name
 
         engine_config = EngineConfig(
             model_name=self._model_name,

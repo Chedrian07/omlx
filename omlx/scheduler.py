@@ -342,6 +342,7 @@ class SchedulerConfig:
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
+    cache_namespace: str = ""  # Optional namespace for paged prefix/KV cache isolation
 
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
@@ -526,10 +527,11 @@ class Scheduler:
                 max_blocks = self._calculate_max_blocks()
 
             # Initialize paged cache manager for block metadata
+            cache_namespace = self.config.cache_namespace or self.config.model_name
             self.paged_cache_manager = PagedCacheManager(
                 block_size=self.config.paged_cache_block_size,
                 max_blocks=max_blocks,
-                model_name=self.config.model_name,
+                model_name=cache_namespace,
                 initial_blocks=self.config.initial_cache_blocks,
             )
             self.block_aware_cache = BlockAwarePrefixCache(
