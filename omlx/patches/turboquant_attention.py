@@ -50,14 +50,84 @@ def apply_turboquant_attention_patch() -> bool:
             real_cache = cache._cache
 
         if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
-            # BatchTurboQuantKVCache still needs a conservative path for decode:
-            # the fused decode kernel in mlx-vlm assumes single-request cache
-            # layout and can corrupt outputs under left-padded continuous batching.
-            # Use dequantize + regular SDPA for correctness.
             if isinstance(real_cache, BatchTurboQuantKVCache):
-                dequantized_keys, dequantized_values = real_cache.dequantize(
-                    keys, values
+                # Continuous batching uses left-padded merged caches. The fused
+                # single-request decode kernel in mlx-vlm cannot consume that
+                # layout directly, and fully dequantizing the merged batch cache
+                # creates very large transient tensors on long VLM prompts.
+                #
+                # For stability, split the batch back into per-request caches
+                # and use the single-request TurboQuant path for decode. This
+                # keeps GPU working set bounded by one request at a time.
+                if queries.shape[0] > 1:
+                    outputs = []
+                    for batch_idx in range(queries.shape[0]):
+                        single_cache = real_cache.extract(batch_idx)
+                        single_query = queries[batch_idx : batch_idx + 1]
+                        single_mask = None
+                        if isinstance(mask, str):
+                            single_mask = mask
+                        elif isinstance(mask, mx.array) and mask.shape[0] == queries.shape[0]:
+                            single_mask = mask[batch_idx : batch_idx + 1]
+
+                        if single_query.shape[-2] == 1:
+                            # Avoid TurboQuant's fused decode kernels for the
+                            # batched VLM path. On long prompts they can still
+                            # trip Metal command-buffer failures, even after
+                            # splitting the merged batch cache back into
+                            # single-request caches. Dequantizing one request at
+                            # a time keeps the transient footprint bounded while
+                            # preserving quantization effects in the cache.
+                            dequantized_keys, dequantized_values = single_cache.dequantize()
+                            outputs.append(
+                                mx.fast.scaled_dot_product_attention(
+                                    single_query,
+                                    dequantized_keys.astype(single_query.dtype),
+                                    dequantized_values.astype(single_query.dtype),
+                                    scale=scale,
+                                    mask=single_mask,
+                                )
+                            )
+                            continue
+
+                        result = single_cache.prefill_attention(
+                            single_query,
+                            scale=scale,
+                            mask=single_mask,
+                        )
+                        if result is None:
+                            dequantized_keys, dequantized_values = single_cache.dequantize()
+                            result = mx.fast.scaled_dot_product_attention(
+                                single_query,
+                                dequantized_keys.astype(single_query.dtype),
+                                dequantized_values.astype(single_query.dtype),
+                                scale=scale,
+                                mask=single_mask,
+                            )
+                        outputs.append(result)
+
+                    return mx.concatenate(outputs, axis=0)
+
+                # B=1 merged caches can also use the extracted single-request
+                # path to avoid materializing full fp16 KV tensors.
+                single_cache = real_cache.extract(0)
+                if queries.shape[-2] == 1:
+                    dequantized_keys, dequantized_values = single_cache.dequantize()
+                    return mx.fast.scaled_dot_product_attention(
+                        queries,
+                        dequantized_keys.astype(queries.dtype),
+                        dequantized_values.astype(queries.dtype),
+                        scale=scale,
+                        mask=mask if isinstance(mask, mx.array) else None,
+                    )
+                result = single_cache.prefill_attention(
+                    queries,
+                    scale=scale,
+                    mask=mask,
                 )
+                if result is not None:
+                    return result
+                dequantized_keys, dequantized_values = single_cache.dequantize()
                 return mx.fast.scaled_dot_product_attention(
                     queries,
                     dequantized_keys.astype(queries.dtype),
