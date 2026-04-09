@@ -64,12 +64,6 @@ def apply_turboquant_attention_patch() -> bool:
                     for batch_idx in range(queries.shape[0]):
                         single_cache = real_cache.extract(batch_idx)
                         single_query = queries[batch_idx : batch_idx + 1]
-                        single_mask = None
-                        if isinstance(mask, str):
-                            single_mask = mask
-                        elif isinstance(mask, mx.array) and mask.shape[0] == queries.shape[0]:
-                            single_mask = mask[batch_idx : batch_idx + 1]
-
                         if single_query.shape[-2] == 1:
                             # Avoid TurboQuant's fused decode kernels for the
                             # batched VLM path. On long prompts they can still
@@ -85,10 +79,16 @@ def apply_turboquant_attention_patch() -> bool:
                                     dequantized_keys.astype(single_query.dtype),
                                     dequantized_values.astype(single_query.dtype),
                                     scale=scale,
-                                    mask=single_mask,
+                                    mask=None,
                                 )
                             )
                             continue
+
+                        single_mask = None
+                        if isinstance(mask, str):
+                            single_mask = mask
+                        elif isinstance(mask, mx.array) and mask.shape[0] == queries.shape[0]:
+                            single_mask = mask[batch_idx : batch_idx + 1]
 
                         result = single_cache.prefill_attention(
                             single_query,
@@ -118,7 +118,7 @@ def apply_turboquant_attention_patch() -> bool:
                         dequantized_keys.astype(queries.dtype),
                         dequantized_values.astype(queries.dtype),
                         scale=scale,
-                        mask=mask if isinstance(mask, mx.array) else None,
+                        mask=None,
                     )
                 result = single_cache.prefill_attention(
                     queries,
