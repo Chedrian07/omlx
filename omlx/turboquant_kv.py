@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import mlx.core as mx
 from mlx_lm.models.cache import (
+    BatchKVCache,
+    CacheList,
     KVCache,
     _BaseCache,
     create_attention_mask,
@@ -199,12 +201,37 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             self.offset = -left_padding[0]
         self._right_padding = None
 
+    @classmethod
+    def from_batch_kv(
+        cls,
+        cache: BatchKVCache,
+        *,
+        bits: float = 4.0,
+        seed: int = 0,
+    ) -> "BatchTurboQuantKVCache":
+        """Convert a BatchKVCache via per-request TQ conversion + merge.
+
+        This is slower than direct batch quantization, but it preserves the
+        semantics of mlx-lm's single-request KVCache exactly and avoids
+        left-padding/offset mismatches when entering decode.
+        """
+        batch_size = int(cache.left_padding.shape[0])
+        per_request = [
+            TurboQuantKVCache.from_cache(cache.extract(i), bits=bits, seed=seed)
+            for i in range(batch_size)
+        ]
+        merged = cls._merge_single_request_caches(per_request, bits=bits, seed=seed)
+        merged._right_padding = cache._right_padding
+        return merged
+
     # ---- update_and_fetch override for B>1 only ----------------------------
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         if isinstance(self.offset, int):
             # B=1: parent's method directly (zero overhead)
-            return super().update_and_fetch(keys, values)
+            result = super().update_and_fetch(keys, values)
+            self._idx = self.offset
+            return result
         # B>1: track per-request offset separately from state offset
         T_new = keys.shape[2]
         # Use int offset for state management
@@ -213,6 +240,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         saved_offset = self.offset
         self.offset = int_offset
         result = super().update_and_fetch(keys, values)
+        self._idx = int_offset + T_new
         self.offset = saved_offset
         return result
 
@@ -222,23 +250,37 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
     def state(self):
         if isinstance(self.offset, int):
             return super().state
-        # B>1: use keys length directly (offset is mx.array, can't compare with int)
+        # B>1: mirror BatchKVCache semantics and slice to the active max length.
         if self.keys is None:
             return None, None
-        length = _state_length(self.keys)
-        return _slice_state(self.keys, length), _slice_state(self.values, length)
+        return _slice_state(self.keys, self._idx), _slice_state(self.values, self._idx)
 
     @state.setter
     def state(self, value):
         TurboQuantKVCache.state.fset(self, value)
+        if self.keys is not None:
+            self._idx = _state_length(self.keys)
+        else:
+            self._idx = 0
 
     # ---- make_mask override (batch-aware) ----------------------------------
 
-    def make_mask(self, *args, **kwargs):
+    def make_mask(
+        self,
+        N: int,
+        return_array: bool = False,
+        **kwargs,
+    ):
+        # Match mlx-lm cache.make_mask signatures. Like BatchKVCache, this
+        # always returns an explicit causal mask array for batched generation.
+        kwargs.pop("return_array", None)
         if isinstance(self.offset, int):
-            return create_attention_mask(*args, offset=self.offset, **kwargs)
+            return create_causal_mask(N, offset=self.offset, **kwargs)
         return create_causal_mask(
-            args[0], offset=self.offset, left_padding=self.left_padding, **kwargs
+            N,
+            offset=self._idx,
+            left_padding=self.left_padding,
+            **kwargs,
         )
 
     # prefill_attention and dequantize inherited from TurboQuantKVCache
@@ -277,53 +319,44 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         self._right_padding = None
 
     def filter(self, batch_indices):
-        self._ensure_array_offset()
-        if self.keys is not None:
-            self.keys = _filter_state(self.keys, batch_indices)
-            self.values = _filter_state(self.values, batch_indices)
-        self.offset = self.offset[batch_indices]
-        self.left_padding = self.left_padding[batch_indices]
+        if self.keys is None:
+            self._ensure_array_offset()
+            self.offset = self.offset[batch_indices]
+            self.left_padding = self.left_padding[batch_indices]
+            self._idx = 0
+            self._cached_state = None
+            self._cached_state_offset = -1
+            return
+
+        temp = self.to_batch_kv()
+        temp.filter(batch_indices)
+        restored = self.from_batch_kv(temp, bits=self.bits, seed=self.seed)
+        self.keys = restored.keys
+        self.values = restored.values
+        self.offset = restored.offset
+        self.left_padding = restored.left_padding
+        self._idx = restored._idx
+        self._right_padding = restored._right_padding
+        self.key_codec = restored.key_codec
+        self.value_codec = restored.value_codec
         self._cached_state = None
         self._cached_state_offset = -1
 
     def extend(self, other: "BatchTurboQuantKVCache"):
-        self._ensure_array_offset()
-        other._ensure_array_offset()
-        max_off = max(self.offset.max().item(), other.offset.max().item())
-        # Use the underlying int offset (total tokens) for state operations
-        s_idx = _state_length(self.keys) if self.keys is not None else 0
-        o_idx = _state_length(other.keys) if other.keys is not None else 0
-        max_idx = max(s_idx, o_idx)
-
-        def _pad_and_trim(c, idx):
-            ks = _slice_state(c.keys, idx) if c.keys is not None else None
-            vs = _slice_state(c.values, idx) if c.values is not None else None
-            left = max_idx - idx
-            if left > 0 and ks is not None:
-                ks = _pad_state_left(ks, left)
-                vs = _pad_state_left(vs, left)
-            return ks, vs, c.offset, c.left_padding + left
-
-        s_ks, s_vs, s_off, s_lp = _pad_and_trim(self, s_idx)
-        o_ks, o_vs, o_off, o_lp = _pad_and_trim(other, o_idx)
-
-        if s_ks is not None and o_ks is not None:
-            self.keys = _concat_state_batch([s_ks, o_ks])
-            self.values = _concat_state_batch([s_vs, o_vs])
-        elif o_ks is not None:
-            self.keys = o_ks
-            self.values = o_vs
-
-        self.offset = mx.concatenate([s_off, o_off])
-        self.left_padding = mx.concatenate([s_lp, o_lp])
-        # Parent's offset is used for state length — set to max
-        # (state property uses self.offset for slicing)
+        temp_self = self.to_batch_kv()
+        temp_other = other.to_batch_kv()
+        temp_self.extend(temp_other)
+        restored = self.from_batch_kv(temp_self, bits=self.bits, seed=self.seed)
+        self.keys = restored.keys
+        self.values = restored.values
+        self.offset = restored.offset
+        self.left_padding = restored.left_padding
+        self._idx = restored._idx
+        self._right_padding = restored._right_padding
+        self.key_codec = restored.key_codec
+        self.value_codec = restored.value_codec
         self._cached_state = None
         self._cached_state_offset = -1
-
-        if self.key_codec is None:
-            self.key_codec = other.key_codec
-            self.value_codec = other.value_codec
 
     def extract(self, idx: int) -> TurboQuantKVCache:
         padding = self.left_padding[idx].item()
@@ -343,8 +376,39 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
     @classmethod
     def merge(cls, caches: List[TurboQuantKVCache]) -> "BatchTurboQuantKVCache":
+        return cls._merge_single_request_caches(
+            caches,
+            bits=caches[0].bits,
+            seed=caches[0].seed,
+        )
+
+    @classmethod
+    def _merge_single_request_caches(
+        cls,
+        caches: List[TurboQuantKVCache],
+        *,
+        bits: float,
+        seed: int,
+    ) -> "BatchTurboQuantKVCache":
         bits = caches[0].bits
         seed = caches[0].seed
+        fp_caches = []
+        for cache in caches:
+            keys, values = cache.state
+            if keys is None or values is None:
+                fp_cache = KVCache()
+                fp_caches.append(fp_cache)
+                continue
+            keys = keys._state if isinstance(keys, _QuantizedStateProxy) else keys
+            values = values._state if isinstance(values, _QuantizedStateProxy) else values
+            fp_cache = KVCache()
+            # Keep the original per-request caches quantized until after merge.
+            # The merged batch cache will be assembled below.
+            fp_cache.keys = keys
+            fp_cache.values = values
+            fp_cache.offset = cache.offset
+            fp_caches.append(fp_cache)
+
         lengths = [c.offset for c in caches]
         max_length = max(lengths)
         padding = [max_length - l for l in lengths]
@@ -377,4 +441,48 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             mx.eval(batch.keys, batch.values)
 
         batch.offset += max_length
+        batch._idx = max_length
         return batch
+
+    def to_batch_kv(self) -> BatchKVCache:
+        """Materialize a temporary fp16 BatchKVCache with identical semantics."""
+        batch = BatchKVCache([int(v) for v in self.left_padding.tolist()])
+        if isinstance(self.offset, int):
+            batch.offset = mx.array([self.offset])
+        else:
+            batch.offset = self.offset
+        batch.left_padding = self.left_padding
+        batch._idx = self._idx
+        batch._right_padding = self._right_padding
+        if self.keys is not None:
+            keys_fp16, values_fp16 = self.dequantize()
+            batch.keys = keys_fp16.astype(mx.float16)
+            batch.values = values_fp16.astype(mx.float16)
+        return batch
+
+
+def turboquant_batch_cache(
+    cache_obj: Any,
+    *,
+    bits: float,
+    seed: int = 0,
+) -> Any:
+    """Recursively convert BatchKVCache entries into TurboQuant batch caches."""
+    if isinstance(cache_obj, BatchTurboQuantKVCache):
+        return cache_obj
+
+    if isinstance(cache_obj, BatchKVCache):
+        return BatchTurboQuantKVCache.from_batch_kv(
+            cache_obj,
+            bits=bits,
+            seed=seed,
+        )
+
+    if isinstance(cache_obj, CacheList):
+        cache_obj.caches = tuple(
+            turboquant_batch_cache(sub_cache, bits=bits, seed=seed)
+            for sub_cache in cache_obj.caches
+        )
+        return cache_obj
+
+    return cache_obj

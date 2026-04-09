@@ -38,6 +38,7 @@ from .cache.prefix_cache import BlockAwarePrefixCache
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .exceptions import is_cache_corruption_error
 from .batch_quantized_kv import BatchQuantizedKVCache, quantize_batch_cache
+from .turboquant_kv import BatchTurboQuantKVCache, turboquant_batch_cache
 
 
 def _sync_and_clear_cache():
@@ -151,6 +152,9 @@ _original_prompt_batch_copy = PromptProcessingBatch._copy
 def _patched_prompt_batch_copy(self):
     new_batch = _original_prompt_batch_copy(self)
     for attr in (
+        "_turboquant_kv_enabled",
+        "_turboquant_kv_bits",
+        "_turboquant_kv_seed",
         "_uniform_kv_enabled",
         "_uniform_kv_bits",
         "_uniform_kv_group_size",
@@ -167,6 +171,39 @@ _original_prompt_batch_generate = PromptProcessingBatch.generate
 
 
 def _patched_prompt_batch_generate(self, tokens):
+    if getattr(self, "_turboquant_kv_enabled", False):
+        if any(len(t) > 1 for t in tokens):
+            self.prompt([t[:-1] for t in tokens])
+        last_token = mx.array([t[-1] for t in tokens])
+
+        bits = float(getattr(self, "_turboquant_kv_bits", 4.0))
+        seed = int(getattr(self, "_turboquant_kv_seed", 0))
+        self.prompt_cache = [
+            turboquant_batch_cache(cache_obj, bits=bits, seed=seed)
+            for cache_obj in self.prompt_cache
+        ]
+
+        generation = GenerationBatch(
+            self.model,
+            self.uids,
+            last_token,
+            self.prompt_cache,
+            self.tokens,
+            self.samplers,
+            self.fallback_sampler,
+            self.logits_processors,
+            self.state_machines,
+            self.max_tokens,
+        )
+
+        self.uids = []
+        self.prompt_cache = []
+        self.tokens = []
+        self.samplers = []
+        self.logits_processors = []
+        self.max_tokens = []
+
+        return generation
     if getattr(self, "_uniform_kv_enabled", False):
         bits = int(getattr(self, "_uniform_kv_bits", 4))
         group_size = int(getattr(self, "_uniform_kv_group_size", 64))
@@ -470,6 +507,7 @@ class Scheduler:
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: Optional[float] = None
+        self._turboquant_kv_seed: int = 0
         self._uniform_kv_bits: Optional[int] = None
         self._uniform_kv_group_size: int = 64
         self._uniform_quantized_kv_start: int = 0
@@ -1006,6 +1044,10 @@ class Scheduler:
             bg._prompt_batch._uniform_quantized_kv_start = int(
                 self._uniform_quantized_kv_start
             )
+        if self._turboquant_kv_bits is not None:
+            bg._prompt_batch._turboquant_kv_enabled = True
+            bg._prompt_batch._turboquant_kv_bits = float(self._turboquant_kv_bits)
+            bg._prompt_batch._turboquant_kv_seed = int(self._turboquant_kv_seed)
 
         return bg
 
@@ -1040,34 +1082,6 @@ class Scheduler:
     # ------------------------------------------------------------------
     # External prefill (composition pattern — replaces _process_prompts)
     # ------------------------------------------------------------------
-
-    def _apply_turboquant_kv(self, prompt_cache: List[Any]) -> None:
-        """Convert individual KVCache layers to TurboQuantKVCache."""
-        from .turboquant_kv import BatchTurboQuantKVCache
-        from mlx_vlm.turboquant import TurboQuantKVCache
-        from mlx_lm.models.cache import KVCache, CacheList
-
-        converted = 0
-        bits = float(self._turboquant_kv_bits)
-        for i, cache_obj in enumerate(prompt_cache):
-            cls_name = type(cache_obj).__name__
-            if isinstance(cache_obj, KVCache):
-                prompt_cache[i] = TurboQuantKVCache(bits=bits)
-                converted += 1
-            elif isinstance(cache_obj, CacheList):
-                new_caches = []
-                for c in cache_obj.caches:
-                    if isinstance(c, KVCache):
-                        new_caches.append(TurboQuantKVCache(bits=bits))
-                        converted += 1
-                    else:
-                        new_caches.append(c)
-                cache_obj.caches = tuple(new_caches)
-        if converted > 0:
-            logger.info(
-                f"TurboQuant: converted {converted}/{len(prompt_cache)} "
-                f"cache layers to {bits}-bit"
-            )
 
     def _do_external_prefill(
         self,

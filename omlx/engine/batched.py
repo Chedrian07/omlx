@@ -256,6 +256,9 @@ class BatchedEngine(BaseEngine):
             if tq_enabled:
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
+                self._engine.engine.scheduler._turboquant_kv_seed = int(
+                    getattr(self._model_settings, "turboquant_seed", 0)
+                )
 
             uniform_enabled = getattr(self._model_settings, "uniform_kv_enabled", False)
             if uniform_enabled:

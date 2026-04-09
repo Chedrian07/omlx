@@ -637,6 +637,9 @@ class VLMBatchedEngine(BaseEngine):
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
+                self._engine.engine.scheduler._turboquant_kv_seed = int(
+                    getattr(self._model_settings, "turboquant_seed", 0)
+                )
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
 
             uniform_enabled = getattr(self._model_settings, "uniform_kv_enabled", False)

@@ -50,6 +50,22 @@ def apply_turboquant_attention_patch() -> bool:
             real_cache = cache._cache
 
         if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
+            # BatchTurboQuantKVCache still needs a conservative path for decode:
+            # the fused decode kernel in mlx-vlm assumes single-request cache
+            # layout and can corrupt outputs under left-padded continuous batching.
+            # Use dequantize + regular SDPA for correctness.
+            if isinstance(real_cache, BatchTurboQuantKVCache):
+                dequantized_keys, dequantized_values = real_cache.dequantize(
+                    keys, values
+                )
+                return mx.fast.scaled_dot_product_attention(
+                    queries,
+                    dequantized_keys.astype(queries.dtype),
+                    dequantized_values.astype(queries.dtype),
+                    scale=scale,
+                    mask=mask,
+                )
+
             if queries.shape[-2] == 1:
                 return real_cache.decode_attention(
                     queries,
